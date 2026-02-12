@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running pre-commit checks..."
+
+echo "Checking formatting..."
+cargo fmt -- --check
+
+echo "Running linter..."
+cargo clippy -- -D warnings
+
+echo "All checks passed."

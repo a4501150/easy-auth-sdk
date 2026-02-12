@@ -1,5 +1,9 @@
 # easy-auth-sdk
 
+[![CI](https://github.com/a4501150/easy-auth-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/a4501150/easy-auth-sdk/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/easy-auth-sdk.svg)](https://crates.io/crates/easy-auth-sdk)
+[![docs.rs](https://img.shields.io/docsrs/easy-auth-sdk)](https://docs.rs/easy-auth-sdk)
+
 A Rust JWT authentication library with RBAC (Role-Based Access Control) support.
 
 ## Features
