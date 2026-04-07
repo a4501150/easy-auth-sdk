@@ -11,6 +11,9 @@ pub enum AuthError {
     #[error("Invalid key: {0}")]
     InvalidKey(String),
 
+    #[error("Key not found for kid: {0}")]
+    KeyNotFound(String),
+
     #[error("Missing required claim: {0}")]
     MissingClaim(String),
 

@@ -6,10 +6,12 @@ pub use claims::Claims;
 pub use error::AuthError;
 pub use jsonwebtoken::Algorithm;
 
+use std::sync::RwLock;
+
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 
 pub struct EasyAuth {
-    decoding_keys: Vec<(Option<String>, DecodingKey)>,
+    decoding_keys: RwLock<Vec<(Option<String>, DecodingKey)>>,
     validation: Validation,
 }
 
@@ -28,7 +30,7 @@ impl EasyAuth {
         validation.validate_exp = true;
 
         Ok(Self {
-            decoding_keys: keys,
+            decoding_keys: RwLock::new(keys),
             validation,
         })
     }
@@ -48,9 +50,20 @@ impl EasyAuth {
         validation.validate_exp = true;
 
         Ok(Self {
-            decoding_keys: vec![(None, key)],
+            decoding_keys: RwLock::new(vec![(None, key)]),
             validation,
         })
+    }
+
+    /// Hot-swap the JWKS keys without reconstructing the `EasyAuth` instance.
+    ///
+    /// Call this when a `KeyNotFound` error indicates the signing keys have
+    /// been rotated and the current key set is stale.
+    pub fn update_jwks(&self, jwks_json: &str) -> Result<(), AuthError> {
+        let keys = jwks::parse_jwks(jwks_json)?;
+        let mut guard = self.decoding_keys.write().expect("decoding_keys poisoned");
+        *guard = keys;
+        Ok(())
     }
 
     /// Validate the JWT token and return the claims.
@@ -69,32 +82,43 @@ impl EasyAuth {
 
     fn decode_token(&self, token: &str) -> Result<Claims, AuthError> {
         let header = decode_header(token)?;
+        let kid = header.kid.as_deref();
 
-        let decoding_key = self.find_key(header.kid.as_deref())?;
+        let guard = self.decoding_keys.read().expect("decoding_keys poisoned");
 
+        let decoding_key = Self::find_key(&guard, kid)?;
         let token_data = decode::<Claims>(token, decoding_key, &self.validation)?;
 
         Ok(token_data.claims)
     }
 
-    fn find_key(&self, kid: Option<&str>) -> Result<&DecodingKey, AuthError> {
+    fn find_key<'a>(
+        keys: &'a [(Option<String>, DecodingKey)],
+        kid: Option<&str>,
+    ) -> Result<&'a DecodingKey, AuthError> {
+        if keys.is_empty() {
+            return Err(AuthError::InvalidKey("No keys available".to_string()));
+        }
+
         match kid {
             Some(kid) => {
-                for (key_kid, key) in &self.decoding_keys {
+                // Look for exact kid match
+                for (key_kid, key) in keys {
                     if key_kid.as_deref() == Some(kid) {
                         return Ok(key);
                     }
                 }
-                self.decoding_keys
-                    .first()
-                    .map(|(_, k)| k)
-                    .ok_or_else(|| AuthError::InvalidKey("No keys available".to_string()))
+                // No match — if all stored keys have kids, this is a key-not-found
+                // (the signing key rotated and we don't have the new one).
+                // If stored keys have no kids (e.g. PEM), fall back to first key.
+                let all_keys_have_kids = keys.iter().all(|(k, _)| k.is_some());
+                if all_keys_have_kids {
+                    Err(AuthError::KeyNotFound(kid.to_string()))
+                } else {
+                    Ok(&keys[0].1)
+                }
             }
-            None => self
-                .decoding_keys
-                .first()
-                .map(|(_, k)| k)
-                .ok_or_else(|| AuthError::InvalidKey("No keys available".to_string())),
+            None => Ok(&keys[0].1),
         }
     }
 }
@@ -338,5 +362,103 @@ mod tests {
     fn test_empty_jwks() {
         let result = EasyAuth::from_jwks_json(r#"{"keys":[]}"#);
         assert!(matches!(result, Err(AuthError::InvalidKey(_))));
+    }
+
+    fn generate_test_keys_with_kid(kid: &str) -> TestKeys {
+        let mut rng = OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = private_key.to_public_key();
+
+        let private_pem = private_key.to_pkcs1_pem(Default::default()).unwrap();
+        let public_pem = public_key.to_public_key_pem(Default::default()).unwrap();
+
+        let encoding_key = EncodingKey::from_rsa_pem(private_pem.as_bytes()).unwrap();
+
+        let n = URL_SAFE_NO_PAD.encode(private_key.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(private_key.e().to_bytes_be());
+
+        let jwks_json = format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"{}","use":"sig","alg":"RS256","n":"{}","e":"{}"}}]}}"#,
+            kid, n, e
+        );
+
+        TestKeys {
+            encoding_key,
+            pem_public: public_pem,
+            jwks_json,
+        }
+    }
+
+    fn create_token_with_kid(keys: &TestKeys, claims: &TestClaims, kid: &str) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        encode(&header, claims, &keys.encoding_key).unwrap()
+    }
+
+    #[test]
+    fn test_key_not_found() {
+        let keys = generate_test_keys_with_kid("old-key");
+        let auth = EasyAuth::from_jwks_json(&keys.jwks_json).unwrap();
+
+        let test_claims = TestClaims {
+            sub: "user-123".to_string(),
+            domain_roles: vec![],
+            exp: now_secs() + 3600,
+            iat: now_secs(),
+        };
+
+        // Sign with a kid that doesn't exist in the JWKS
+        let token = create_token_with_kid(&keys, &test_claims, "rotated-new-key");
+        let result = auth.validate(&token);
+        assert!(
+            matches!(result, Err(AuthError::KeyNotFound(ref kid)) if kid == "rotated-new-key"),
+            "Expected KeyNotFound for unknown kid, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_update_jwks() {
+        let old_keys = generate_test_keys_with_kid("old-key");
+        let new_keys = generate_test_keys_with_kid("new-key");
+        let auth = EasyAuth::from_jwks_json(&old_keys.jwks_json).unwrap();
+
+        let test_claims = TestClaims {
+            sub: "user-123".to_string(),
+            domain_roles: vec![],
+            exp: now_secs() + 3600,
+            iat: now_secs(),
+        };
+
+        // Token signed with new key initially fails
+        let token = create_token_with_kid(&new_keys, &test_claims, "new-key");
+        assert!(matches!(
+            auth.validate(&token),
+            Err(AuthError::KeyNotFound(_))
+        ));
+
+        // After updating JWKS with new keys, validation succeeds
+        auth.update_jwks(&new_keys.jwks_json).unwrap();
+        let claims = auth.validate(&token).unwrap();
+        assert_eq!(claims.sub, "user-123");
+    }
+
+    #[test]
+    fn test_pem_fallback_no_key_not_found() {
+        // PEM keys have no kid — should fall back to first key, not KeyNotFound
+        let keys = generate_test_keys();
+        let auth = EasyAuth::from_pem(&keys.pem_public).unwrap();
+
+        let test_claims = TestClaims {
+            sub: "user-123".to_string(),
+            domain_roles: vec![],
+            exp: now_secs() + 3600,
+            iat: now_secs(),
+        };
+
+        // Token with an unknown kid still works because PEM keys have no kids
+        let token = create_token_with_kid(&keys, &test_claims, "any-kid");
+        let claims = auth.validate(&token).unwrap();
+        assert_eq!(claims.sub, "user-123");
     }
 }
